@@ -2,8 +2,9 @@
 
 from typing import Optional, Dict, Any
 import json
+import re
 
-from config import get_deepseek_client, DEEPSEEK_MODEL, REPORT_CONFIG
+from config import get_deepseek_client, DEEPSEEK_MODEL, REPORT_CONFIG, CORE_INDICATORS, DEFAULT_TOLERANCE
 from data_retriever import DataContext, retrieve_all_data
 from prompt_templates import get_report_prompt, get_followup_prompt, get_validation_prompt
 
@@ -101,7 +102,7 @@ class ReportGenerator:
     
     def validate_report(self) -> Dict[str, Any]:
         """
-        校验报告（检测幻觉）
+        校验报告（检测幻觉）- 使用硬编码校验逻辑
         
         Returns:
             校验结果字典
@@ -109,36 +110,24 @@ class ReportGenerator:
         if self.data_context is None or self.generated_report is None:
             return {"error": "没有可校验的报告"}
         
-        # 获取校验提示词
-        prompt = get_validation_prompt(
-            data_json=self.data_context.to_json(),
-            report=self.generated_report
-        )
+        # 将 DataContext 转换为字典格式（与 streamlit_app.py 中的格式一致）
+        ctx_dict = {
+            "USDCNY_MID": self.data_context.cny.get("usdcny_mid"),
+            "USDCNH_CLOSE": self.data_context.cny.get("usdcnh_spot"),
+            "CNY_SPREAD": self.data_context.cny.get("cny_spread"),
+            "USDHKD": self.data_context.hkd.get("usdhkd"),
+            "HIBOR_OVERNIGHT": self.data_context.hkd.get("hibor_overnight"),
+            "HKD_USD_SPREAD": self.data_context.hkd.get("hkd_usd_spread"),
+            "EURUSD": self.data_context.global_fx.get("eurusd"),
+            "USDJPY": self.data_context.global_fx.get("usdjpy"),
+            "DXY": self.data_context.global_fx.get("dxy"),
+            "US10Y_YIELD": self.data_context.macro.get("us10y"),
+            "US2Y_YIELD": self.data_context.macro.get("us2y"),
+            "VIX_LAST": self.data_context.macro.get("vix"),
+        }
         
-        # 调用 LLM 进行校验
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2000,
-            temperature=0.1  # 校验任务使用更低温度
-        )
-        
-        try:
-            # 尝试解析 JSON 结果
-            result_text = response.choices[0].message.content
-            # 提取 JSON 部分
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', result_text)
-            if json_match:
-                self.validation_result = json.loads(json_match.group())
-            else:
-                self.validation_result = {"raw_response": result_text}
-        except json.JSONDecodeError:
-            self.validation_result = {"raw_response": response.choices[0].message.content}
-        
+        # 调用硬编码校验函数
+        self.validation_result = verify_numbers_hard_code(ctx_dict, self.generated_report)
         return self.validation_result
     
     def get_data_summary(self) -> str:
@@ -195,6 +184,132 @@ class ReportGenerator:
         if self.data_context is None:
             return "{}"
         return self.data_context.to_json()
+
+
+# ============================================================================
+# 硬编码校验函数
+# ============================================================================
+
+def verify_numbers_hard_code(data_context: Dict[str, Any], report_text: str) -> Dict[str, Any]:
+    """
+    使用硬编码逻辑校验报告中的数值是否与原始数据一致
+    
+    Args:
+        data_context: 数据字典，键名为 CORE_INDICATORS 中定义的 data_field
+        report_text: 生成的报告文本
+        
+    Returns:
+        校验结果字典，包含 is_valid 和 audit_log
+    """
+    audit_log = []
+    is_valid = True
+    
+    # 浮点数正则表达式（支持负数）
+    float_pattern = r'-?\d+\.?\d*'
+    
+    # 遍历所有核心指标
+    for indicator_name, config in CORE_INDICATORS.items():
+        keywords = config["keywords"]
+        data_field = config["data_field"]
+        tolerance = config.get("tolerance", DEFAULT_TOLERANCE)
+        
+        # 获取原始数据值
+        raw_val = data_context.get(data_field)
+        
+        # 如果原始数据为 None，标记为 WARNING（数据缺失），不进行比对
+        if raw_val is None:
+            audit_log.append({
+                "item": indicator_name,
+                "report_val": None,
+                "raw_val": None,
+                "diff": None,
+                "status": "WARNING",
+                "msg": "数据缺失"
+            })
+            continue
+        
+        # 尝试从报告中提取数值
+        report_val = None
+        matched_keyword = None
+        
+        for keyword in keywords:
+            # 在报告中搜索关键词位置
+            keyword_match = re.search(re.escape(keyword), report_text, re.IGNORECASE)
+            
+            if keyword_match:
+                # 从关键词结束位置开始，向后搜索30字符内的浮点数
+                keyword_end_pos = keyword_match.end()
+                search_text = report_text[keyword_end_pos:keyword_end_pos + 50]  # 向后搜索50字符
+                
+                # 在搜索文本中查找浮点数（避免匹配关键词本身包含的数字）
+                # 优先匹配带小数点的数字（更可能是实际数值，而不是年份或编号）
+                decimal_pattern = r'-?\d+\.\d+'
+                number_matches = re.findall(decimal_pattern, search_text)
+                
+                # 如果没有找到带小数点的数字，再尝试匹配整数
+                if not number_matches:
+                    number_matches = re.findall(float_pattern, search_text)
+                
+                if number_matches:
+                    # 尝试每个数值，选择最接近原始值的那个
+                    best_val = None
+                    min_diff = float('inf')
+                    
+                    for num_str in number_matches:
+                        try:
+                            candidate_val = float(num_str)
+                            # 计算与原始值的差异
+                            diff = abs(candidate_val - raw_val)
+                            
+                            # 选择差异最小的数值（但也要在合理范围内，差异超过10的可能是误匹配）
+                            if diff < min_diff and diff < 10:
+                                min_diff = diff
+                                best_val = candidate_val
+                        except ValueError:
+                            continue
+                    
+                    if best_val is not None:
+                        report_val = best_val
+                        matched_keyword = keyword
+                        break  # 找到匹配就退出关键词循环
+        
+        # 判断结果
+        if report_val is None:
+            # 未在报告中提及
+            audit_log.append({
+                "item": indicator_name,
+                "report_val": None,
+                "raw_val": raw_val,
+                "diff": None,
+                "status": "WARNING",
+                "msg": "未在报告中提及"
+            })
+            # WARNING 不影响 is_valid 状态
+        else:
+            # 进行数值比对
+            diff = abs(report_val - raw_val)
+            
+            if diff <= tolerance:
+                status = "PASS"
+                msg = f"一致（差异 {diff:.4f} <= 容差 {tolerance}）"
+            else:
+                status = "FAIL"
+                msg = f"差异 {diff:.4f} > 容差 {tolerance}"
+                is_valid = False  # 有一个失败就标记为无效
+            
+            audit_log.append({
+                "item": indicator_name,
+                "report_val": report_val,
+                "raw_val": raw_val,
+                "diff": round(diff, 4),
+                "status": status,
+                "msg": msg
+            })
+    
+    return {
+        "is_valid": is_valid,
+        "audit_log": audit_log
+    }
 
 
 # ============================================================================

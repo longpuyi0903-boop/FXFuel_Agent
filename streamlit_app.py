@@ -3,6 +3,7 @@
 import streamlit as st
 import datetime
 import traceback
+import re
 
 # --- 页面配置 ---
 st.set_page_config(page_title="外汇周报生成器", layout="wide")
@@ -19,11 +20,50 @@ if 'messages' not in st.session_state:
     st.session_state['messages'] = []
 if 'data_collected' not in st.session_state:
     st.session_state['data_collected'] = False
+if 'validation_result' not in st.session_state:
+    st.session_state['validation_result'] = None
 
 CHAT_HISTORY_LIMIT = 3
 today = datetime.date.today()
 REPORT_DATE = today.strftime("%Y年%m月%d日")
 REPORT_PERIOD = f"截至 {REPORT_DATE}"
+
+
+# ==============================================================================
+# 工具函数
+# ==============================================================================
+
+def _mark_historical_comparisons(text: str) -> str:
+    """
+    识别报告中的历史对比表述，并使用下划线标记
+    
+    只标记真正的历史对比表述，不标记数据中的日期、年份
+    """
+    marked_text = text
+    
+    # 只标记明确的历史对比表述，避免标记数据中的日期
+    # 1. 完整的历史对比短语（优先级最高）
+    marked_text = re.sub(r'(?<!__)从形态上看(?!__)', r'__从形态上看__', marked_text)
+    marked_text = re.sub(r'(?<!__)形态上类似(?!__)', r'__形态上类似__', marked_text)
+    marked_text = re.sub(r'(?<!__)类似于(?!__)', r'__类似于__', marked_text)
+    
+    # 2. "历史" + 高点/低点等（但排除数据日期，如"2025年"这类具体日期）
+    # 使用更精确的匹配：历史+高点/低点，且不在数据上下文中
+    marked_text = re.sub(r'(?<![\d年月日])历史(高点|低点|峰值|高位|低位)(?![\d年月日])', r'__历史\1__', marked_text)
+    
+    # 3. 历史对比词（避免匹配数据中的"之前"、"过去"等）
+    # 只在明确的历史对比语境中标记（如"较之前"、"较过去"等）
+    marked_text = re.sub(r'较(过去|之前|以往)(?![\d年月日])', r'较__\1__', marked_text)
+    marked_text = re.sub(r'比(过去|之前|以往)(?![\d年月日])', r'比__\1__', marked_text)
+    
+    # 4. 高点/低点（只在明确的对比语境中标记，避免标记数据中的"高点"、"低点"）
+    # 例如"创历史高点"、"接近历史低点"等，但不标记"最高点7.328"这种数据表述
+    marked_text = re.sub(r'(创|接近|触及|达到)(高点|低点|峰值|高位|低位)(?![\d\.])', r'\1__\2__', marked_text)
+    
+    # 不再标记年份，因为会误标记数据中的日期
+    # 不再标记单独的"类似"、"过去"等词，避免误匹配
+    
+    return marked_text
 
 
 # ==============================================================================
@@ -64,8 +104,9 @@ def do_collect_data(progress_callback=None):
         "VIX_LAST": ctx_obj.macro.get("vix"),
         "FED_RATE": ctx_obj.macro.get("fed_rate"),
         "MARKET_SENTIMENT": ctx_obj.macro.get("market_sentiment"),
-        "NEWS": ctx_obj.news,
-        "NEWS_SOURCES": ctx_obj.news_sources,  # 添加新闻源链接
+        "NEWS": ctx_obj.news,  # 短标题（用于页面展示）
+        "NEWS_DETAIL": ctx_obj.news_detail,  # 详细摘要（用于LLM生成报告）
+        "NEWS_SOURCES": ctx_obj.news_sources,
         "ERRORS": ctx_obj.errors,
         "data_points": ctx_obj._count_data_points(),
     }
@@ -84,6 +125,7 @@ with st.sidebar:
         st.session_state['data_collected'] = False
         st.session_state['report_text'] = ""
         st.session_state['messages'] = []
+        st.session_state['validation_result'] = None
         st.rerun()
     
     # 生成报告按钮 - 检查data_context是否存在
@@ -128,31 +170,28 @@ if not st.session_state.get('data_collected', False):
     st.info("👆 点击「刷新数据」或下方按钮开始采集")
     
     if st.button("🚀 开始采集数据", use_container_width=True):
-        progress_bar = st.progress(0, text="正在初始化...")
-        status_text = st.empty()
-        
-        def update_progress(step, total, msg):
-            progress_bar.progress(step / total)
-            status_text.text(msg)
-        
         try:
-            with st.spinner("正在采集外汇数据..."):
+            with st.status("📡 正在连接权威数据源...", expanded=True) as status:
+                status.write("📡 正在连接权威数据源 (外管局/FRED/AKShare)...")
+                
+                def update_progress(step, total, msg):
+                    status.write(msg)
+                
                 ctx = do_collect_data(progress_callback=update_progress)
+                
+                status.write("🔍 数据清洗与格式化...")
+                status.write("✅ 数据采集完成")
             
             # 保存到 session state
             st.session_state['data_context'] = ctx
             st.session_state['data_collected'] = True
             
-            progress_bar.progress(1.0)
-            status_text.text(f"✅ 完成！{ctx['data_points']} 个数据点")
-            st.success(f"✅ 数据采集完成！共 {ctx['data_points']} 个数据点，{len(ctx.get('NEWS', []))} 条新闻")
+            st.success(f"✅ 数据就绪！共 {ctx['data_points']} 个数据点，{len(ctx.get('NEWS', []))} 条新闻")
             
             # 自动刷新页面以显示数据
             st.rerun()
             
         except Exception as e:
-            progress_bar.progress(100, text="❌ 采集失败")
-            status_text.text("❌ 采集失败")
             st.error(f"❌ 数据采集失败: {str(e)}")
             st.code(traceback.format_exc())
 
@@ -223,14 +262,15 @@ else:
                     
                     # 获取对应的URLs（可能有多个）
                     urls = []
-                    if i < len(news_sources) and news_sources[i]:
+                    if i < len(news_sources) and news_sources[i] is not None:
                         source_urls = news_sources[i] if isinstance(news_sources[i], list) else [news_sources[i]]
                         urls = [u for u in source_urls if u and isinstance(u, str) and u.startswith('http')]
                     
                     # 展示：编号 + 内容 + 链接(可能多个)
                     if urls:
-                        links = " ".join([f"[🔗]({url})" for url in urls[:3]])  # 最多显示3个链接
-                        st.markdown(f"{i+1}. {news_text} {links}")
+                        # 为每个链接创建可点击的格式
+                        links_text = " ".join([f"[🔗]({url})" for url in urls[:3]])  # 最多显示3个链接
+                        st.markdown(f"{i+1}. {news_text} {links_text}")
                     else:
                         st.markdown(f"{i+1}. {news_text}")
         elif ctx.get('ERRORS'):
@@ -254,143 +294,127 @@ if generate_btn and st.session_state.get('data_collected', False):
     if not ctx:
         st.error("数据未加载，请先采集数据")
     else:
-        progress_bar = st.progress(0, text="📝 正在构建报告...")
-        
         try:
-            from config import DEEPSEEK_CLIENT, DEEPSEEK_MODEL_NAME
-        except ImportError:
-            st.error("❌ 无法导入 config.py")
-            st.stop()
-        
-        # System Prompt
-        system_prompt = f"""你是顶尖的投行外汇策略师，生成专业的中文外汇周报。
-
-**核心要求**
-1. 数据准确：使用【基础数据】中的精确数字，标注来源
-2. 新闻融入：将【本周新闻】融入分析，用"据[来源]报道"格式
-3. 专业分析：有逻辑推演，不只是数据罗列
-4. 专业措辞：使用"承压"、"走强"、"偏鸽/偏鹰"等表达
-
-**新闻引用格式**
-- 据[路透]报道，...
-- [彭博]指出，...
-
-**禁止**
-- 禁止编造数据或新闻
-- 数据为空则说明"数据暂缺"
-"""
-        
-        # 数据输入
-        api_data = f"""
-**【基础数据】**
-
-人民币：
-- USD/CNY 中间价: {ctx.get('USDCNY_MID') or 'N/A'} (外管局)
-- 中间价区间: {ctx.get('USDCNY_MID_RANGE') or 'N/A'}
-- USD/CNH 离岸: {ctx.get('USDCNH_CLOSE') or 'N/A'} (东方财富)
-- 价差: {ctx.get('CNY_SPREAD') or 'N/A'}
-
-港元：
-- USD/HKD: {ctx.get('USDHKD') or 'N/A'} (东方财富)
-- 联汇位置: {ctx.get('LERS_POSITION') or 'N/A'}
-- HIBOR隔夜: {ctx.get('HIBOR_OVERNIGHT') or 'N/A'}% (金管局)
-- 港美利差: {ctx.get('HKD_USD_SPREAD') or 'N/A'}%
-
-全球：
-- DXY: {ctx.get('DXY') or 'N/A'} (ICE)
-- EUR/USD: {ctx.get('EURUSD') or 'N/A'}
-- USD/JPY: {ctx.get('USDJPY') or 'N/A'}
-- GBP/USD: {ctx.get('GBPUSD') or 'N/A'}
-
-宏观：
-- 10Y美债: {ctx.get('US10Y_YIELD') or 'N/A'}% (FRED)
-- 2Y美债: {ctx.get('US2Y_YIELD') or 'N/A'}%
-- 收益率曲线: {ctx.get('YIELD_CURVE') or 'N/A'}%
-- VIX: {ctx.get('VIX_LAST') or 'N/A'} (CBOE)
-- 联邦基金利率: {ctx.get('FED_RATE') or 'N/A'}%
-- 市场情绪: {ctx.get('MARKET_SENTIMENT') or 'N/A'}
-"""
-        
-        # 新闻输入
-        news_input = "\n**【本周市场动态】**（融入报告分析）\n"
-        news_list = ctx.get('NEWS', [])
-        if news_list:
-            for i, item in enumerate(news_list[:12], 1):
-                if isinstance(item, dict):
-                    content = item.get('content', '')
-                    news_input += f"{i}. {content}\n"
-                else:
-                    news_input += f"{i}. {item}\n"
-        else:
-            news_input += "（暂无新闻）\n"
-        
-        progress_bar.progress(30, text="⚡ 调用 DeepSeek...")
-        
-        user_prompt = f"""生成外汇周报。
-
-**报告日期**: {REPORT_DATE}
-
-{api_data}
-{news_input}
-
-**报告结构**（一页纸篇幅）
-
-## 🌐 外汇周报：{REPORT_PERIOD}
-
-### I. 市场主题与核心观点
-（总结本周核心动态）
-
-### II. 人民币汇率 (CNY & CNH)
-
-### III. 港元汇率 (HKD)
-
-### IV. 美元及宏观驱动
-
-### V. 主要货币对策略
-
-### VI. 下周焦点与风险提示
-
----
-*数据快照: {ctx.get('SNAPSHOT', '')}*
-
-**重要提示**：
-- 数据标注来源（如"外管局"、"FRED"、"东方财富"等）
-- 不要编造"据路透/彭博报道"这类来源标注
-- 直接陈述事实和分析，无需标注新闻来源
-"""
-        
-        report_placeholder = st.empty()
-        full_response = ""
-        
-        try:
-            response_stream = DEEPSEEK_CLIENT.chat.completions.create(
-                model=DEEPSEEK_MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.4,
-                max_tokens=4000,
-                stream=True
-            )
+            from config import DEEPSEEK_CLIENT, DEEPSEEK_MODEL_NAME, DEEPSEEK_MODEL, REPORT_CONFIG
+            from report_generator import verify_numbers_hard_code
+            from prompt_templates import get_report_prompt
+            from data_retriever import DataContext
             
-            for chunk in response_stream:
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    full_response += chunk.choices[0].delta.content
-                    report_placeholder.markdown(full_response)
-                    progress = min(30 + len(full_response) // 50, 95)
-                    progress_bar.progress(progress, text="✍️ AI 撰写中...")
+            # 将字典转换为 DataContext 对象以便使用 prompt_templates（包含历史锚点）
+            ctx_obj = DataContext()
+            ctx_obj.snapshot = ctx.get('SNAPSHOT', '')
+            ctx_obj.cny = {
+                "usdcny_mid": ctx.get('USDCNY_MID'),
+                "usdcnh_spot": ctx.get('USDCNH_CLOSE'),
+                "cny_spread": ctx.get('CNY_SPREAD'),
+                "usdcny_mid_date": ctx.get('USDCNY_MID_DATE', ''),
+                "usdcny_mid_range": ctx.get('USDCNY_MID_RANGE'),
+                "usdcny_mid_high": ctx.get('USDCNY_MID_HIGH'),
+                "usdcny_mid_low": ctx.get('USDCNY_MID_LOW'),
+            }
+            ctx_obj.hkd = {
+                "usdhkd": ctx.get('USDHKD'),
+                "hibor_overnight": ctx.get('HIBOR_OVERNIGHT'),
+                "hibor_1w": ctx.get('HIBOR_1W'),
+                "hibor_1m": ctx.get('HIBOR_1M'),
+                "hkd_usd_spread": ctx.get('HKD_USD_SPREAD'),
+                "lers_position": ctx.get('LERS_POSITION'),
+            }
+            ctx_obj.global_fx = {
+                "eurusd": ctx.get('EURUSD'),
+                "usdjpy": ctx.get('USDJPY'),
+                "gbpusd": ctx.get('GBPUSD'),
+                "audusd": ctx.get('AUDUSD'),
+                "usdcad": ctx.get('USDCAD'),
+                "usdchf": ctx.get('USDCHF'),
+                "dxy": ctx.get('DXY'),
+            }
+            ctx_obj.macro = {
+                "us10y": ctx.get('US10Y_YIELD'),
+                "us2y": ctx.get('US2Y_YIELD'),
+                "yield_curve": ctx.get('YIELD_CURVE'),
+                "vix": ctx.get('VIX_LAST'),
+                "fed_rate": ctx.get('FED_RATE'),
+                "market_sentiment": ctx.get('MARKET_SENTIMENT'),
+            }
+            ctx_obj.news = ctx.get('NEWS', [])
+            ctx_obj.news_detail = ctx.get('NEWS_DETAIL', [])  # 详细摘要用于LLM生成报告
+            ctx_obj.news_sources = ctx.get('NEWS_SOURCES', [])
+            ctx_obj.errors = ctx.get('ERRORS', [])
             
-            progress_bar.progress(100, text="✅ 完成！")
+            with st.status("📝 正在生成报告...", expanded=True) as status:
+                status.write("📊 读取已采集数据...")
+                
+                # 使用 prompt_templates（包含历史锚点）生成报告
+                data_json = ctx_obj.to_json()
+                prompts = get_report_prompt(data_json)
+                
+                status.write("✍️ 正在撰写报告...")
+                report_placeholder = st.empty()
+                full_response = ""
+                
+                response_stream = DEEPSEEK_CLIENT.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": prompts["system"]},
+                        {"role": "user", "content": prompts["user"]}
+                    ],
+                    max_tokens=REPORT_CONFIG["max_tokens"],
+                    temperature=REPORT_CONFIG["temperature"],
+                    stream=True
+                )
+                
+                for chunk in response_stream:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        full_response += chunk.choices[0].delta.content
+                        report_placeholder.markdown(full_response)
+                
+                status.write("🔍 执行数值校验...")
+                # 执行校验（使用字典格式，与 do_collect_data 返回的格式一致）
+                validation_result = verify_numbers_hard_code(ctx, full_response)
+                st.session_state['validation_result'] = validation_result
+                status.write("✅ 报告生成完成")
+            
+            # 保存报告到 session_state
             st.session_state['report_text'] = full_response
             st.session_state['pitch_ready'] = True
             
+            # 刷新页面使状态框消失（与数据采集阶段一致）
+            st.rerun()
+            
+        except ImportError as e:
+            st.error(f"❌ 无法导入必要模块: {e}")
+            st.code(traceback.format_exc())
         except Exception as e:
-            progress_bar.progress(100, text="❌ 失败")
-            st.error(f"DeepSeek 错误: {e}")
+            st.error(f"❌ 报告生成失败: {e}")
+            st.code(traceback.format_exc())
 
 elif st.session_state.get('report_text'):
-    st.markdown(st.session_state['report_text'])
+    # 处理历史对比标记（添加下划线）
+    marked_report = _mark_historical_comparisons(st.session_state['report_text'])
+    
+    # 显示已生成的报告
+    st.markdown(marked_report)
+    
+    # 显示校验结果（如果存在）
+    validation_result = st.session_state.get('validation_result')
+    if validation_result:
+        import pandas as pd
+        if validation_result.get('is_valid', False):
+            st.success("✅ 数据校验通过 (点击查看详情)")
+            with st.expander("🔍 审计日志"):
+                audit_df = pd.DataFrame(validation_result.get('audit_log', []))
+                st.table(audit_df)
+        else:
+            fail_count = sum(1 for item in validation_result.get('audit_log', []) if item.get('status') == 'FAIL')
+            st.warning(f"⚠️ 发现 {fail_count} 处数据潜在偏差 (点击查看详情)")
+            with st.expander("🔍 审计日志"):
+                audit_df = pd.DataFrame(validation_result.get('audit_log', []))
+                st.table(audit_df)
+    
+    # 免责声明
+    st.caption("⚠️ **风险提示**：本报告中的历史行情对比基于 AI 语义分析及静态锚点数据，非全量历史数据回测结果。所有投资决策请以实时盘面为准。")
+    
     st.session_state['pitch_ready'] = True
 
 elif st.session_state.get('data_collected'):

@@ -49,7 +49,8 @@ class DataContext:
         self.hkd = {}
         self.global_fx = {}
         self.macro = {}
-        self.news = []
+        self.news = []  # 短标题列表（用于页面展示）
+        self.news_detail = []  # 详细摘要列表（用于LLM生成报告）
         self.news_sources = []
         self.data_sources = {}
         self.errors = []
@@ -63,6 +64,7 @@ class DataContext:
             "global_fx": self.global_fx,
             "macro": self.macro,
             "news": self.news,
+            "news_detail": self.news_detail,
             "news_sources": self.news_sources,
             "data_sources": self.data_sources,
             "errors": self.errors,
@@ -109,8 +111,12 @@ def fetch_cny_data(ctx: DataContext) -> str:
                 ctx.cny["usdcny_mid_range"] = f"{round(recent.min(), 4)} - {round(recent.max(), 4)}"
                 ctx.cny["usdcny_mid_high"] = round(recent.max(), 4)
                 ctx.cny["usdcny_mid_low"] = round(recent.min(), 4)
+            else:
+                # API 失败或数据无效，显式设置 None
+                ctx.cny["usdcny_mid"] = None
         except Exception as e:
             ctx.errors.append(f"人民币中间价: {str(e)[:80]}")
+            ctx.cny["usdcny_mid"] = None
         
         try:
             fx_df = None
@@ -128,11 +134,18 @@ def fetch_cny_data(ctx: DataContext) -> str:
                 if not cnh_row.empty:
                     ctx.cny["usdcnh_spot"] = float(cnh_row['最新价'].iloc[0])
                     ctx.data_sources["usdcnh"] = "东方财富"
-                
-                if ctx.cny.get("usdcny_mid") and ctx.cny.get("usdcnh_spot"):
+                else:
+                    # 未找到 USDCNH 数据
+                    ctx.cny["usdcnh_spot"] = None
+                # 计算价差（如果两个值都存在）
+                if ctx.cny.get("usdcny_mid") is not None and ctx.cny.get("usdcnh_spot") is not None:
                     ctx.cny["cny_spread"] = round(ctx.cny["usdcnh_spot"] - ctx.cny["usdcny_mid"], 4)
+            else:
+                # API 失败或数据无效，显式设置 None
+                ctx.cny["usdcnh_spot"] = None
         except Exception as e:
             ctx.errors.append(f"离岸汇率: {str(e)[:80]}")
+            ctx.cny["usdcnh_spot"] = None
         
         parts = []
         if ctx.cny.get("usdcny_mid"):
@@ -213,6 +226,7 @@ def fetch_hkd_data(ctx: DataContext) -> str:
         
         if not hkd_found:
             ctx.errors.append("USD/HKD: 所有数据源失败")
+            ctx.hkd["usdhkd"] = None  # 显式设置 None
         
         # HIBOR 从金管局获取
         try:
@@ -230,10 +244,18 @@ def fetch_hkd_data(ctx: DataContext) -> str:
                         ctx.hkd["hibor_1w"] = float(latest['ir_1week'])
                     if 'ir_1month' in latest:
                         ctx.hkd["hibor_1m"] = float(latest['ir_1month'])
+            else:
+                # API 成功但数据格式不正确，显式设置 None
+                if "hibor_overnight" not in ctx.hkd:
+                    ctx.hkd["hibor_overnight"] = None
         except Exception as e:
             ctx.errors.append(f"HIBOR: {str(e)[:40]}")
+            # API 失败，显式设置 None
+            if "hibor_overnight" not in ctx.hkd:
+                ctx.hkd["hibor_overnight"] = None
         
-        if ctx.hkd.get("hibor_overnight") and ctx.macro.get("fed_rate"):
+        # 计算港美利差（只有在两个值都不为 None 时才计算）
+        if ctx.hkd.get("hibor_overnight") is not None and ctx.macro.get("fed_rate") is not None:
             ctx.hkd["hkd_usd_spread"] = round(ctx.hkd["hibor_overnight"] - ctx.macro["fed_rate"], 2)
         
         result = f"✅ 港元: {ctx.hkd.get('usdhkd', 'N/A')}"
@@ -295,10 +317,35 @@ def fetch_dxy_direct(ctx: DataContext) -> bool:
     except Exception as e:
         ctx.errors.append(f"DXY(Yahoo): {str(e)[:40]}")
     
-    # 方案2: 东方财富全球指数
+    # 方案2: 东方财富全球指数（尝试多个可能的接口）
     try:
         import akshare as ak
-        df = ak.index_global_em()
+        df = None
+        # 尝试不同的接口
+        for method_name in ['index_global_em', 'tool_trade_date_hist_sina']:
+            try:
+                if hasattr(ak, method_name):
+                    if method_name == 'index_global_em':
+                        df = ak.index_global_em()
+                    break
+            except:
+                continue
+        
+        # 如果上述方法都失败，尝试从外汇数据中获取
+        if df is None or df.empty:
+            try:
+                fx_df = ak.forex_spot_em()
+                if fx_df is not None and not fx_df.empty:
+                    dxy_row = fx_df[fx_df['名称'].str.contains('美元指数', na=False)]
+                    if not dxy_row.empty:
+                        dxy_val = round(float(dxy_row['最新价'].iloc[0]), 2)
+                        if 90 <= dxy_val <= 115:
+                            ctx.global_fx["dxy"] = dxy_val
+                            ctx.data_sources["dxy"] = "东方财富"
+                            return True
+            except:
+                pass
+        
         if df is not None and not df.empty:
             dxy_row = df[df['名称'].str.contains('美元指数', na=False)]
             if not dxy_row.empty:
@@ -312,6 +359,7 @@ def fetch_dxy_direct(ctx: DataContext) -> bool:
     
     # 不使用FRED贸易加权指数，因为范围不同会误导用户
     ctx.errors.append("DXY: ICE美元指数获取失败")
+    ctx.global_fx["dxy"] = None  # 显式设置 None
     return False
 
 
@@ -370,6 +418,7 @@ def fetch_global_fx(ctx: DataContext) -> str:
         
         if "dxy" not in ctx.global_fx:
             ctx.errors.append("DXY: 所有数据源均失败")
+            ctx.global_fx["dxy"] = None  # 显式设置 None
         
         return f"✅ 全球外汇: {', '.join(found)}" if found else "⚠️ 全球外汇数据缺失"
         
@@ -399,18 +448,25 @@ def fetch_fred_data(ctx: DataContext) -> str:
                 ctx.macro["us10y"] = round(float(us10y.iloc[-1]), 2)
                 ctx.data_sources["us10y"] = "FRED"
                 results.append("10Y")
-        except:
-            pass
+            else:
+                ctx.macro["us10y"] = None  # API 返回空数据，显式设置 None
+        except Exception as e:
+            ctx.errors.append(f"US10Y: {str(e)[:40]}")
+            ctx.macro["us10y"] = None  # API 失败，显式设置 None
         
         try:
             us2y = fred.get_series_latest_release("DGS2")
             if us2y is not None and not us2y.empty:
                 ctx.macro["us2y"] = round(float(us2y.iloc[-1]), 2)
                 results.append("2Y")
-        except:
-            pass
+            else:
+                ctx.macro["us2y"] = None  # API 返回空数据，显式设置 None
+        except Exception as e:
+            ctx.errors.append(f"US2Y: {str(e)[:40]}")
+            ctx.macro["us2y"] = None  # API 失败，显式设置 None
         
-        if ctx.macro.get("us10y") and ctx.macro.get("us2y"):
+        # 计算收益率曲线（只有在两个值都不为 None 时才计算）
+        if ctx.macro.get("us10y") is not None and ctx.macro.get("us2y") is not None:
             ctx.macro["yield_curve"] = round(ctx.macro["us10y"] - ctx.macro["us2y"], 2)
         
         try:
@@ -429,16 +485,22 @@ def fetch_fred_data(ctx: DataContext) -> str:
                     ctx.macro["market_sentiment"] = "谨慎"
                 else:
                     ctx.macro["market_sentiment"] = "恐慌"
-        except:
-            pass
+            else:
+                ctx.macro["vix"] = None  # API 返回空数据，显式设置 None
+        except Exception as e:
+            ctx.errors.append(f"VIX: {str(e)[:40]}")
+            ctx.macro["vix"] = None  # API 失败，显式设置 None
         
         try:
             ffr = fred.get_series_latest_release("FEDFUNDS")
             if ffr is not None and not ffr.empty:
                 ctx.macro["fed_rate"] = round(float(ffr.iloc[-1]), 2)
                 results.append("FedRate")
-        except:
-            pass
+            else:
+                ctx.macro["fed_rate"] = None  # API 返回空数据，显式设置 None
+        except Exception as e:
+            ctx.errors.append(f"FedRate: {str(e)[:40]}")
+            ctx.macro["fed_rate"] = None  # API 失败，显式设置 None
         
         return f"✅ FRED: {', '.join(results)}" if results else "⚠️ FRED 数据缺失"
         
@@ -450,8 +512,7 @@ def fetch_fred_data(ctx: DataContext) -> str:
 def fetch_perplexity_news(ctx: DataContext) -> str:
     """使用 Perplexity API 获取外汇相关新闻
     
-    范围：人民币/港元/G10货币对美元、各国央行政策
-    来源：权威财经媒体+央行官网
+    方案B：分两次调用，分别搜索英文和中文来源
     """
     api_key = os.getenv("PERPLEXITY_API_KEY")
     if not api_key:
@@ -463,53 +524,14 @@ def fetch_perplexity_news(ctx: DataContext) -> str:
         "Content-Type": "application/json"
     }
     
-    today = datetime.now().strftime("%Y年%m月%d日")
-    
-    payload = {
-        "model": "sonar-pro",
-        "messages": [
-            {
-                "role": "system",
-                "content": """你是专业外汇市场新闻编辑。
-
-【新闻范围】
-1. 人民币(USD/CNY, USD/CNH)：中间价、离岸在岸价差、中国央行(PBOC)、外管局(SAFE)政策
-2. 港元(USD/HKD)：联系汇率、香港金管局(HKMA)操作、HIBOR
-3. G10货币对美元：EUR/USD、USD/JPY、GBP/USD、AUD/USD、USD/CAD、USD/CHF等
-4. 各国央行政策：美联储(Fed/FOMC)、欧央行(ECB)、日本央行(BOJ)、英国央行(BOE)等
-5. 美元指数(DXY)、美债收益率、VIX、风险情绪
-
-【输出格式】
-直接输出新闻内容，每条一行，用数字编号。不要标注来源名称。
-
-示例：
-1. 美联储12月FOMC会议宣布降息25基点至4.25%-4.50%，但点阵图显示2025年仅预期降息两次
-2. 中国央行将人民币中间价设定为7.1876，连续第三日维持在7.19下方
-3. 香港金管局入市买入18.46亿港元，为本月第四次捍卫联系汇率
-
-注意：
-- 所有货币对以美元为基准（USD/JPY，不要JPY/USD）
-- 只报道事实，不要加"据XX报道"这类来源标注
-- 新闻要具体、有数据支撑"""
-            },
-            {
-                "role": "user", 
-                "content": f"""搜索{today}前后一周的外汇市场重要新闻：
-
-1. 美联储/FOMC最新政策和官员讲话
-2. 中国央行/外管局政策、人民币中间价和汇率走势
-3. 香港金管局操作、港元和HIBOR动态
-4. 其他G10货币（EUR/USD、USD/JPY、GBP/USD等）重大变动
-5. 影响汇市的宏观数据和风险事件
-
-列出10-12条最重要的新闻，要求具体、有数据。"""
-            }
-        ],
-        "max_tokens": 2500,
-        "temperature": 0.1,
-        "return_citations": True,
-        "search_recency_filter": "week"
-    }
+    # 计算日期范围
+    from datetime import timedelta
+    today_date = datetime.now()
+    week_ago = today_date - timedelta(days=7)
+    today_display = today_date.strftime("%B %d, %Y")
+    week_ago_display = week_ago.strftime("%B %d, %Y")
+    today_cn = today_date.strftime("%Y年%m月%d日")
+    week_ago_cn = week_ago.strftime("%Y年%m月%d日")
     
     # 配置代理
     proxies = None
@@ -525,88 +547,221 @@ def fetch_perplexity_news(ctx: DataContext) -> str:
             else:
                 socks5_url = socks5_proxy.replace("socks5://", "socks5h://")
             proxies = {"http": socks5_url, "https": socks5_url}
-            ctx.data_sources["perplexity_proxy"] = f"SOCKS5"
         except ImportError:
             ctx.errors.append("需要: pip install requests[socks]")
-            proxies = None
     elif http_proxy or https_proxy:
         proxies = {"http": http_proxy, "https": https_proxy or http_proxy}
-        ctx.data_sources["perplexity_proxy"] = "HTTP代理"
-    else:
-        ctx.data_sources["perplexity_proxy"] = "直连"
+    
+    # ========== 英文 Prompt ==========
+    payload_en = {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""You are an FX market news editor. Search ONLY English sources from {week_ago_display} to {today_display}.
+
+Sources: Bloomberg, Reuters, Financial Times, WSJ, Federal Reserve, ECB, BOJ.
+
+Output format - for each news item:
+1. [EN]
+TITLE: Headline here [1]
+DETAIL: 150-200 word summary with specific data [1]
+
+2. [EN]
+TITLE: Next headline [2]
+DETAIL: Summary [2]
+
+IMPORTANT: 
+- Each news starts with number and [EN] on its own line
+- TITLE and DETAIL on separate lines
+- Every line must end with citation [1], [2], etc."""
+            },
+            {
+                "role": "user", 
+                "content": f"Find 8 important English FX news. Topics: Fed/FOMC, DXY, EUR/USD, USD/JPY, Treasury yields. Use the exact format specified."
+            }
+        ],
+        "max_tokens": 4000,
+        "temperature": 0.1,
+        "return_citations": True,
+        "search_recency_filter": "week"
+    }
+    
+    # ========== 中文 Prompt ==========
+    payload_cn = {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""你是外汇市场新闻编辑。只搜索 {week_ago_cn} 至 {today_cn} 的中文来源。
+
+来源：央行官网(pbc.gov.cn)、外管局(safe.gov.cn)、财新网、第一财经、金管局(hkma.gov.hk)。
+
+输出格式 - 每条新闻：
+1. [CN]
+TITLE: 标题内容 [1]
+DETAIL: 150-200字摘要，包含具体数据 [1]
+
+2. [CN]
+TITLE: 下一条标题 [2]
+DETAIL: 摘要内容 [2]
+
+重要：
+- 每条新闻以数字和[CN]开头，单独一行
+- TITLE和DETAIL分开两行
+- 每行结尾必须有引用标记[1], [2]等"""
+            },
+            {
+                "role": "user", 
+                "content": f"搜索7条重要中文外汇新闻。主题：人民币中间价、USD/CNY、央行政策、港元、金管局。严格按照指定格式输出。"
+            }
+        ],
+        "max_tokens": 3500,
+        "temperature": 0.1,
+        "return_citations": True,
+        "search_recency_filter": "week"
+    }
+    
+    # ========== 解析函数 ==========
+    def parse_response(content, citations, lang_tag):
+        """解析 Perplexity 返回内容"""
+        # 提取有效 URLs
+        valid_urls = []
+        for c in citations:
+            if isinstance(c, str) and c.startswith('http'):
+                valid_urls.append(c)
+            elif isinstance(c, dict):
+                url = c.get('url') or c.get('link')
+                if url and url.startswith('http'):
+                    valid_urls.append(url)
+        
+        lines = content.strip().split('\n')
+        news_items = []
+        current = {'title': '', 'detail': '', 'refs': []}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # 检测新闻开始: "1. [EN]" 或 "1. [CN]" 或 "1.[EN]" 等
+            start_match = re.match(r'^(\d+)[\.\)]\s*\[(EN|CN)\]\s*$', line, re.IGNORECASE)
+            if start_match:
+                # 保存上一条
+                if current['title']:
+                    news_items.append(current.copy())
+                current = {'title': '', 'detail': '', 'refs': []}
+                continue
+            
+            # 检测 TITLE 行
+            if line.upper().startswith('TITLE:'):
+                # 提取引用标记
+                refs = re.findall(r'\[(\d+)\]', line)
+                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
+                # 清除引用标记后存储
+                current['title'] = re.sub(r'\s*\[\d+\]\s*', ' ', line[6:]).strip()
+                continue
+            
+            # 检测 DETAIL 行
+            if line.upper().startswith('DETAIL:'):
+                refs = re.findall(r'\[(\d+)\]', line)
+                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
+                current['detail'] = re.sub(r'\s*\[\d+\]\s*', ' ', line[7:]).strip()
+                continue
+            
+            # 累积 DETAIL（多行情况）
+            if current['title'] and not re.match(r'^\d+[\.\)]\s*\[', line):
+                refs = re.findall(r'\[(\d+)\]', line)
+                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
+                clean = re.sub(r'\s*\[\d+\]\s*', ' ', line).strip()
+                if clean and not clean.startswith('#'):
+                    current['detail'] += ' ' + clean
+        
+        # 保存最后一条
+        if current['title']:
+            news_items.append(current.copy())
+        
+        # 构建结果
+        results = []
+        for item in news_items:
+            title = f"[{lang_tag}] TITLE: {item['title']}"
+            detail = item['detail'] if item['detail'] else item['title']
+            # 分配 URLs
+            urls = []
+            for ref_idx in set(item['refs']):
+                if 0 <= ref_idx < len(valid_urls):
+                    urls.append(valid_urls[ref_idx])
+            results.append((title, detail, urls))
+        
+        return results, len(valid_urls)
+    
+    # ========== 执行 API 调用 ==========
+    all_news = []
+    total_urls = 0
+    en_count = 0
+    cn_count = 0
     
     try:
         session = requests.Session()
-        response = session.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=(30, 120),
-            verify=False,
-            proxies=proxies
-        )
         
-        if response.status_code == 200:
-            result = response.json()
-            content = result['choices'][0]['message']['content']
-            # Perplexity 的 citations 是一个URL数组
-            citations = result.get('citations', [])
-            
-            lines = content.strip().split('\n')
-            news_count = 0
-            
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#') or line.startswith('---') or line.startswith('【'):
-                    continue
-                
-                # 清理行首的编号和符号
-                news_content = re.sub(r'^[\d]+[.、)\]\s]+', '', line).strip()
-                news_content = news_content.lstrip('•*- ').strip()
-                
-                if news_content and len(news_content) > 20:
-                    # 方法1: 从新闻内容中提取引用标记 [1], [2][3] 等
-                    ref_matches = re.findall(r'\[(\d+)\]', news_content)
-                    
-                    urls = []
-                    if ref_matches:
-                        # 有引用标记，按标记匹配
-                        for ref in ref_matches:
-                            ref_idx = int(ref) - 1
-                            if 0 <= ref_idx < len(citations):
-                                citation = citations[ref_idx]
-                                if isinstance(citation, str) and citation.startswith('http'):
-                                    if citation not in urls:
-                                        urls.append(citation)
-                        # 清理引用标记
-                        news_content = re.sub(r'\s*\[\d+\]\s*', ' ', news_content).strip()
-                    else:
-                        # 方法2: 没有引用标记，按顺序分配 citations
-                        if news_count < len(citations):
-                            citation = citations[news_count]
-                            if isinstance(citation, str) and citation.startswith('http'):
-                                urls.append(citation)
-                    
-                    ctx.news.append(news_content)
-                    ctx.news_sources.append(urls if urls else [])
-                    news_count += 1
-            
-            ctx.data_sources["news"] = "Perplexity搜索"
-            ctx.data_sources["news_citations_count"] = len(citations)
-            return f"✅ 新闻: {news_count} 条 (引用源: {len(citations)}个)"
-        else:
-            error_msg = f"API错误 {response.status_code}"
-            try:
-                err_json = response.json()
-                error_msg += f": {err_json.get('error', {}).get('message', '')[:50]}"
-            except:
-                pass
-            ctx.errors.append(f"Perplexity: {error_msg}")
-            return f"❌ Perplexity: {error_msg}"
-            
-    except requests.exceptions.Timeout:
-        ctx.errors.append("Perplexity: 连接超时")
-        return "⚠️ Perplexity: 超时"
+        # 调用英文 API
+        try:
+            resp_en = session.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers=headers, json=payload_en,
+                timeout=(30, 120), verify=False, proxies=proxies
+            )
+            if resp_en.status_code == 200:
+                result = resp_en.json()
+                content = result['choices'][0]['message']['content']
+                citations = result.get('citations', [])
+                if not citations:
+                    citations = result['choices'][0].get('message', {}).get('citations', [])
+                news_en, urls_en = parse_response(content, citations, 'EN')
+                all_news.extend(news_en)
+                total_urls += urls_en
+                en_count = len(news_en)
+            else:
+                ctx.errors.append(f"Perplexity EN: {resp_en.status_code}")
+        except Exception as e:
+            ctx.errors.append(f"Perplexity EN: {str(e)[:50]}")
+        
+        # 调用中文 API
+        try:
+            resp_cn = session.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers=headers, json=payload_cn,
+                timeout=(30, 120), verify=False, proxies=proxies
+            )
+            if resp_cn.status_code == 200:
+                result = resp_cn.json()
+                content = result['choices'][0]['message']['content']
+                citations = result.get('citations', [])
+                if not citations:
+                    citations = result['choices'][0].get('message', {}).get('citations', [])
+                news_cn, urls_cn = parse_response(content, citations, 'CN')
+                all_news.extend(news_cn)
+                total_urls += urls_cn
+                cn_count = len(news_cn)
+            else:
+                ctx.errors.append(f"Perplexity CN: {resp_cn.status_code}")
+        except Exception as e:
+            ctx.errors.append(f"Perplexity CN: {str(e)[:50]}")
+        
+        # 存储结果
+        news_with_urls = 0
+        for title, detail, urls in all_news:
+            ctx.news.append(title)
+            ctx.news_detail.append(detail)
+            ctx.news_sources.append(urls)
+            if urls:
+                news_with_urls += 1
+        
+        ctx.data_sources["news"] = "Perplexity(EN+CN)"
+        ctx.data_sources["news_valid_urls"] = total_urls
+        
+        return f"✅ 新闻: {len(all_news)} 条 (EN:{en_count} + CN:{cn_count}, 有链接: {news_with_urls}/{len(all_news)})"
+        
     except Exception as e:
         ctx.errors.append(f"Perplexity: {str(e)[:60]}")
         return f"⚠️ Perplexity: {str(e)[:40]}"
@@ -615,11 +770,17 @@ def fetch_perplexity_news(ctx: DataContext) -> str:
 def calculate_metrics(ctx: DataContext) -> str:
     results = []
     
-    if ctx.hkd.get("hibor_overnight") and ctx.macro.get("fed_rate") and not ctx.hkd.get("hkd_usd_spread"):
+    # 计算港美利差（只有在两个值都不为 None 且还未计算时）
+    if (ctx.hkd.get("hibor_overnight") is not None and 
+        ctx.macro.get("fed_rate") is not None and 
+        "hkd_usd_spread" not in ctx.hkd):
         ctx.hkd["hkd_usd_spread"] = round(ctx.hkd["hibor_overnight"] - ctx.macro["fed_rate"], 2)
         results.append("港美利差")
     
-    if ctx.cny.get("usdcny_mid") and ctx.cny.get("usdcnh_spot") and not ctx.cny.get("cny_spread"):
+    # 计算 CNY 价差（只有在两个值都不为 None 且还未计算时）
+    if (ctx.cny.get("usdcny_mid") is not None and 
+        ctx.cny.get("usdcnh_spot") is not None and 
+        "cny_spread" not in ctx.cny):
         ctx.cny["cny_spread"] = round(ctx.cny["usdcnh_spot"] - ctx.cny["usdcny_mid"], 4)
         results.append("CNY价差")
     
