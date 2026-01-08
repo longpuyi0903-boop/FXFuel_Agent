@@ -160,15 +160,19 @@ def fetch_cny_data(ctx: DataContext) -> str:
         import akshare as ak
         
         try:
-            mid_df = None
-            for attempt in range(3):
-                try:
-                    mid_df = ak.currency_boc_safe()
-                    if mid_df is not None and not mid_df.empty and '美元' in mid_df.columns:
-                        break
-                except:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
+            # 使用缓存获取中间价（9:15发布后整天不变，缓存1小时）
+            def _fetch_mid():
+                for attempt in range(3):
+                    try:
+                        df = ak.currency_boc_safe()
+                        if df is not None and not df.empty and '美元' in df.columns:
+                            return df
+                    except:
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                return None
+            
+            mid_df = get_with_cache("cny_mid", _fetch_mid, CACHE_TTL.get("cny_mid", 3600))
             
             if mid_df is not None and not mid_df.empty and '美元' in mid_df.columns:
                 usd_col = mid_df['美元'].astype(float) / 100
@@ -188,15 +192,19 @@ def fetch_cny_data(ctx: DataContext) -> str:
             ctx.cny["usdcny_mid"] = None
         
         try:
-            fx_df = None
-            for attempt in range(3):
-                try:
-                    fx_df = ak.forex_spot_em()
-                    if fx_df is not None and not fx_df.empty:
-                        break
-                except:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
+            # 使用缓存获取离岸汇率（实时数据，缓存1分钟）
+            def _fetch_spot():
+                for attempt in range(3):
+                    try:
+                        df = ak.forex_spot_em()
+                        if df is not None and not df.empty:
+                            return df
+                    except:
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                return None
+            
+            fx_df = get_with_cache("cny_spot", _fetch_spot, CACHE_TTL.get("cny_spot", 60))
             
             if fx_df is not None and not fx_df.empty:
                 cnh_row = fx_df[fx_df['代码'].str.contains('USDCNH', case=False, na=False)]
@@ -511,35 +519,44 @@ def fetch_fred_data(ctx: DataContext) -> str:
         fred = Fred(api_key=fred_key)
         results = []
         
+        # 使用缓存获取 FRED 数据（缓存5分钟）
+        fred_ttl = CACHE_TTL.get("fred", 300)
+        
         try:
-            us10y = fred.get_series_latest_release("DGS10")
+            def _fetch_us10y():
+                return fred.get_series_latest_release("DGS10")
+            us10y = get_with_cache("fred_us10y", _fetch_us10y, fred_ttl)
             if us10y is not None and not us10y.empty:
                 ctx.macro["us10y"] = round(float(us10y.iloc[-1]), 2)
                 ctx.data_sources["us10y"] = "FRED"
                 results.append("10Y")
             else:
-                ctx.macro["us10y"] = None  # API 返回空数据，显式设置 None
+                ctx.macro["us10y"] = None
         except Exception as e:
             ctx.errors.append(f"US10Y: {str(e)[:40]}")
-            ctx.macro["us10y"] = None  # API 失败，显式设置 None
+            ctx.macro["us10y"] = None
         
         try:
-            us2y = fred.get_series_latest_release("DGS2")
+            def _fetch_us2y():
+                return fred.get_series_latest_release("DGS2")
+            us2y = get_with_cache("fred_us2y", _fetch_us2y, fred_ttl)
             if us2y is not None and not us2y.empty:
                 ctx.macro["us2y"] = round(float(us2y.iloc[-1]), 2)
                 results.append("2Y")
             else:
-                ctx.macro["us2y"] = None  # API 返回空数据，显式设置 None
+                ctx.macro["us2y"] = None
         except Exception as e:
             ctx.errors.append(f"US2Y: {str(e)[:40]}")
-            ctx.macro["us2y"] = None  # API 失败，显式设置 None
+            ctx.macro["us2y"] = None
         
         # 计算收益率曲线（只有在两个值都不为 None 时才计算）
         if ctx.macro.get("us10y") is not None and ctx.macro.get("us2y") is not None:
             ctx.macro["yield_curve"] = round(ctx.macro["us10y"] - ctx.macro["us2y"], 2)
         
         try:
-            vix = fred.get_series_latest_release("VIXCLS")
+            def _fetch_vix():
+                return fred.get_series_latest_release("VIXCLS")
+            vix = get_with_cache("fred_vix", _fetch_vix, fred_ttl)
             if vix is not None and not vix.empty:
                 vix_val = round(float(vix.iloc[-1]), 2)
                 ctx.macro["vix"] = vix_val
@@ -555,21 +572,23 @@ def fetch_fred_data(ctx: DataContext) -> str:
                 else:
                     ctx.macro["market_sentiment"] = "恐慌"
             else:
-                ctx.macro["vix"] = None  # API 返回空数据，显式设置 None
+                ctx.macro["vix"] = None
         except Exception as e:
             ctx.errors.append(f"VIX: {str(e)[:40]}")
-            ctx.macro["vix"] = None  # API 失败，显式设置 None
+            ctx.macro["vix"] = None
         
         try:
-            ffr = fred.get_series_latest_release("FEDFUNDS")
+            def _fetch_ffr():
+                return fred.get_series_latest_release("FEDFUNDS")
+            ffr = get_with_cache("fred_ffr", _fetch_ffr, fred_ttl)
             if ffr is not None and not ffr.empty:
                 ctx.macro["fed_rate"] = round(float(ffr.iloc[-1]), 2)
                 results.append("FedRate")
             else:
-                ctx.macro["fed_rate"] = None  # API 返回空数据，显式设置 None
+                ctx.macro["fed_rate"] = None
         except Exception as e:
             ctx.errors.append(f"FedRate: {str(e)[:40]}")
-            ctx.macro["fed_rate"] = None  # API 失败，显式设置 None
+            ctx.macro["fed_rate"] = None
         
         return f"✅ FRED: {', '.join(results)}" if results else "⚠️ FRED 数据缺失"
         
@@ -815,6 +834,31 @@ def _parse_news_response(content: str, citations: list, category: str) -> list[d
             })
         
         i += 2
+    
+    # ========== Fallback 机制 ==========
+    # 如果正则解析失败但内容不为空，降级处理
+    if not news_items and content and len(content.strip()) > 50:
+        # 尝试按段落分割
+        paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+        if paragraphs:
+            # 取前2段作为降级新闻
+            for idx, para in enumerate(paragraphs[:2]):
+                # 提取第一句作为标题
+                first_sentence = para.split('。')[0].split('.')[0][:100]
+                news_items.append({
+                    "category": category,
+                    "title": first_sentence.strip(),
+                    "summary": para[:500],  # 截断防止 token 爆炸
+                    "urls": valid_urls[:1] if valid_urls else []
+                })
+        else:
+            # 最终降级：整段作为一条
+            news_items.append({
+                "category": category,
+                "title": f"{category} 市场动态",
+                "summary": content[:500],
+                "urls": valid_urls[:1] if valid_urls else []
+            })
     
     return news_items
 
