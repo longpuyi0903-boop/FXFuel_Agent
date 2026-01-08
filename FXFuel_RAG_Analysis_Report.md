@@ -7,12 +7,12 @@
 **当前版本：V3**（2025-01-08 更新）
 
 **总体评价**：
-- **RAG 完成度**：85%（V3 修复了缓存断路、解析脆弱性、新闻幻觉问题）
+- **RAG 完成度**：90%（V3 修复了缓存断路、解析脆弱性、新闻幻觉问题，缓存已全量覆盖）
 - **架构合理性**：★★★★☆（符合金融场景需求，但可扩展性受限）
 - **行业规范符合度**：★★★★☆（核心机制完善，缺少历史数据检索）
 
 **V3 版本改进**：
-- ✅ 缓存功能真正接通（解决 Gemini 指出的"代码断路"问题）
+- ✅ 缓存功能全量接通（CNY/HKD/Global/FRED/Perplexity 全覆盖）
 - ✅ 新闻解析增加 Fallback 机制（增强鲁棒性）
 - ✅ Self-Citation 引用规则（降低新闻幻觉风险）
 
@@ -383,7 +383,7 @@ resp = requests.post(
 | **P0-1** | Token 预算管理 | 20行 | 防止生成失败 | ✅ **V2 已实现** |
 | **P0-2** | 统一超时配置 | 10行 | 减少网络报错 | ✅ **V2 已实现** |
 | **P0-3** | Perplexity 分类检索 | 200行 | 提升新闻质量 | ✅ **V2 已实现** |
-| **P1-1** | 缓存接通 | 30行 | 避免重复请求 | ✅ **V3 已实现** |
+| **P1-1** | 缓存接通（全量） | 50行 | 避免重复请求 | ✅ **V3 已实现** |
 | **P1-2** | 新闻解析 Fallback | 25行 | 增强鲁棒性 | ✅ **V3 已实现** |
 | **P1-3** | Self-Citation | 10行 | 降低新闻幻觉 | ✅ **V3 已实现** |
 | P2-4 | 凭空数字检测 | 中 | 增强校验 | ⏸️ 暂不做，易误报 |
@@ -399,18 +399,24 @@ resp = requests.post(
 
 基于 Gemini 的代码审查反馈，V3 版本修复了以下"代码断路"问题：
 
-#### 1. ✅ 缓存接通（Critical Fix）
+#### 1. ✅ 缓存全量接通（Critical Fix）
 
-**问题**：V2 定义了 `get_with_cache()` 函数，但没有在任何地方调用。
+**问题**：V2 只在 `fetch_cny_data` 和 `fetch_fred_data` 接通了缓存，遗漏了其他模块。
 
-**修复**：在以下函数中接通缓存：
-- `fetch_cny_data()` - 中间价缓存 1 小时，实时汇率缓存 1 分钟
-- `fetch_fred_data()` - FRED 数据缓存 5 分钟
+**V3 修复**：所有数据获取函数均已接通缓存：
 
-```python
-# 修复后的调用方式
-mid_df = get_with_cache("cny_mid", _fetch_mid, CACHE_TTL.get("cny_mid", 3600))
-```
+| 函数 | 缓存 Key | TTL |
+|------|----------|-----|
+| `fetch_cny_data` | `cny_mid`, `cny_spot` | 3600s / 60s |
+| `fetch_hkd_data` | `hkd_spot` | 60s |
+| `fetch_global_fx` | `global_fx` | 60s |
+| `fetch_fred_data` | `fred_us10y`, `fred_vix` 等 | 300s |
+| `fetch_perplexity_news_v2` | `news_POLICY_日期` 等 | 600s |
+
+**效果**：
+- 用户短时间内刷新不再重复调用 API
+- Perplexity 新闻缓存 10 分钟，大幅节省 API 费用
+- 追问时复用已缓存数据，响应更快
 
 #### 2. ✅ 新闻解析 Fallback
 

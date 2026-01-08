@@ -247,19 +247,20 @@ def fetch_hkd_data(ctx: DataContext) -> str:
     try:
         import akshare as ak
         
-        # 方法1: 东方财富外汇行情
+        # 方法1: 东方财富外汇行情（使用缓存，1分钟TTL）
         try:
-            fx_df = None
-            for attempt in range(3):
-                try:
-                    fx_df = ak.forex_spot_em()
-                    if fx_df is not None and not fx_df.empty:
-                        break
-                except Exception as e:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                    else:
-                        ctx.errors.append(f"东方财富API: {str(e)[:40]}")
+            def _fetch_hkd_spot():
+                for attempt in range(3):
+                    try:
+                        df = ak.forex_spot_em()
+                        if df is not None and not df.empty:
+                            return df
+                    except Exception as e:
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                return None
+            
+            fx_df = get_with_cache("hkd_spot", _fetch_hkd_spot, CACHE_TTL.get("hkd", 60))
             
             if fx_df is not None and not fx_df.empty:
                 hkd_row = fx_df[fx_df['代码'].str.contains('USDHKD', case=False, na=False)]
@@ -445,15 +446,19 @@ def fetch_global_fx(ctx: DataContext) -> str:
     try:
         import akshare as ak
         
-        fx_df = None
-        for attempt in range(3):
-            try:
-                fx_df = ak.forex_spot_em()
-                if fx_df is not None and not fx_df.empty:
-                    break
-            except:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+        # 使用缓存获取全球外汇数据（1分钟TTL）
+        def _fetch_global_spot():
+            for attempt in range(3):
+                try:
+                    df = ak.forex_spot_em()
+                    if df is not None and not df.empty:
+                        return df
+                except:
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            return None
+        
+        fx_df = get_with_cache("global_fx", _fetch_global_spot, CACHE_TTL.get("global_fx", 60))
         
         found = []
         
@@ -930,20 +935,29 @@ def fetch_perplexity_news_v2(ctx) -> str:
     stats = {"POLICY": 0, "MACRO": 0, "CNY": 0}
     
     session = requests.Session()
+    news_ttl = CACHE_TTL.get("news", 600)  # 新闻缓存 10 分钟
     
     for category, payload in queries:
         try:
-            resp = session.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=TIMEOUT_CONFIG.get("perplexity", (30, 90)),
-                verify=False,  # 为兼容代理环境
-                proxies=proxies
-            )
+            # 使用缓存获取新闻（避免短时间内重复请求烧钱）
+            cache_key = f"news_{category}_{today_date.strftime('%Y%m%d')}"
             
-            if resp.status_code == 200:
-                result = resp.json()
+            def _fetch_news():
+                resp = session.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=TIMEOUT_CONFIG.get("perplexity", (30, 90)),
+                    verify=False,  # 为兼容代理环境
+                    proxies=proxies
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                return None
+            
+            result = get_with_cache(cache_key, _fetch_news, news_ttl)
+            
+            if result:
                 content = result['choices'][0]['message']['content']
                 citations = result.get('citations', [])
                 if not citations:
@@ -953,7 +967,7 @@ def fetch_perplexity_news_v2(ctx) -> str:
                 all_news.extend(news_items)
                 stats[category] = len(news_items)
             else:
-                ctx.errors.append(f"Perplexity {category}: HTTP {resp.status_code}")
+                ctx.errors.append(f"Perplexity {category}: 请求失败")
                 
         except Exception as e:
             ctx.errors.append(f"Perplexity {category}: {str(e)[:50]}")
