@@ -741,7 +741,7 @@ SUMMARY: ..."""
 # 解析函数（简化版）
 # ============================================================================
 
-def _parse_news_response(content: str, citations: list, category: str) -> List[Dict]:
+def _parse_news_response(content: str, citations: list, category: str) -> list[dict]:
     """
     解析 Perplexity 返回的新闻内容
     
