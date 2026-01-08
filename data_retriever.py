@@ -578,10 +578,265 @@ def fetch_fred_data(ctx: DataContext) -> str:
         return "❌ FRED 获取失败"
 
 
-def fetch_perplexity_news(ctx: DataContext) -> str:
-    """使用 Perplexity API 获取外汇相关新闻
+# ============================================================================
+# Perplexity 新闻检索模块（重构版 v2）
+# 
+# 改进点：
+# 1. 分 3 类查询：央行政策、地缘宏观、人民币港元专题
+# 2. Prompt 导向"分析"而非"数据播报"
+# 3. 明确排除野鸡源
+# 4. 简化解析逻辑
+# ============================================================================
+
+
+# ============================================================================
+# Prompt 模板（核心改进）
+# ============================================================================
+
+def _get_prompt_policy(week_ago: str, today: str) -> dict:
+    """央行政策 & 汇率分析"""
+    return {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""You are an FX market analyst. Search for news from {week_ago} to {today}.
+
+Your task: Find central bank policy news and FX market analysis.
+
+Sources to prioritize:
+- Reuters, Bloomberg, Financial Times, Wall Street Journal
+- Official: Federal Reserve, ECB, BOJ, PBOC, HKMA
+- Research: Goldman Sachs, Morgan Stanley, JP Morgan
+
+Topics:
+- Fed interest rate policy and dollar outlook
+- Central bank policy divergence
+- Major currency pair analysis (EUR/USD, USD/JPY, GBP/USD)
+
+IMPORTANT RULES:
+- Return ANALYSIS and COMMENTARY, not raw price data
+- Exclude: fx168, jin10, investing.com price feeds, currency converters
+- Each item must explain WHY it matters for FX markets
+- Do NOT include routine daily fixing announcements
+
+Output exactly 4 items in this format:
+1. [POLICY]
+TITLE: Clear headline describing the news
+SUMMARY: 2-3 sentences explaining the news and its FX market impact
+
+2. [POLICY]
+TITLE: ...
+SUMMARY: ..."""
+            },
+            {
+                "role": "user",
+                "content": "Find 4 important central bank policy and FX analysis news from the past week. Focus on analysis, not data."
+            }
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.1,
+        "return_citations": True,
+        "search_recency_filter": "week"
+    }
+
+
+def _get_prompt_geopolitical(week_ago: str, today: str) -> dict:
+    """宏观 & 地缘政治"""
+    return {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""You are a macro strategist. Search for news from {week_ago} to {today}.
+
+Your task: Find geopolitical and macro events that impact currency markets.
+
+Topics to cover:
+- US-China relations, trade policy, tariffs
+- Regional conflicts or tensions (Middle East, Latin America, Europe, Asia)
+- Sanctions, asset freezes, capital controls
+- Major economic data SURPRISES (not routine releases)
+- Commodity shocks affecting FX (oil, gold, copper)
+- Political events (elections, policy shifts, government changes)
+
+IMPORTANT RULES:
+- Focus on events that MOVE currency markets
+- Explain the FX impact, not just describe the event
+- Include specific market reactions where possible
+- Exclude routine economic data unless it caused significant moves
+
+Output exactly 4 items in this format:
+1. [MACRO]
+TITLE: Clear headline describing the event
+SUMMARY: 2-3 sentences explaining the event and its currency market impact
+
+2. [MACRO]
+TITLE: ...
+SUMMARY: ..."""
+            },
+            {
+                "role": "user",
+                "content": "Find 4 major geopolitical or macro events from the past week that impacted or could impact FX markets. Explain the currency implications."
+            }
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.1,
+        "return_citations": True,
+        "search_recency_filter": "week"
+    }
+
+
+def _get_prompt_cny_hkd(week_ago_cn: str, today_cn: str) -> dict:
+    """人民币/港元专题（中文）"""
+    return {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""你是外汇市场分析师。搜索 {week_ago_cn} 至 {today_cn} 的新闻。
+
+任务：寻找人民币和港元的深度分析报道。
+
+优先来源：
+- 财新网、第一财经、21世纪经济报道、证券时报、经济观察报
+- 券商研报：中金公司、招商证券、兴业证券、华泰证券、中信证券
+- 官方解读：央行、外管局、金管局政策分析
+
+内容要求：
+- 汇率走势分析和后市展望
+- 政策解读（中间价信号、逆周期因子、MLF/LPR影响）
+- 资金流向、结售汇数据分析、套息交易
+- 离岸在岸价差及其含义
+- 人民币国际化进展
+
+严格排除：
+- 纯数据播报（如"今日中间价报7.xxxx"）
+- 汇率换算工具、外汇牌价查询页面
+- fx168、金十等平台的机械数据播报
+- 没有分析内容的价格公告
+
+输出格式（严格4条）：
+1. [CNY]
+TITLE: 清晰的新闻标题
+SUMMARY: 2-3句话说明新闻内容及市场影响
+
+2. [CNY]
+TITLE: ...
+SUMMARY: ..."""
+            },
+            {
+                "role": "user",
+                "content": "搜索4条本周人民币和港元的深度分析报道。必须是分析文章，不要数据播报。"
+            }
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.1,
+        "return_citations": True,
+        "search_recency_filter": "week"
+    }
+
+
+# ============================================================================
+# 解析函数（简化版）
+# ============================================================================
+
+def _parse_news_response(content: str, citations: list, category: str) -> List[Dict]:
+    """
+    解析 Perplexity 返回的新闻内容
     
-    方案B：分两次调用，分别搜索英文和中文来源
+    Args:
+        content: API 返回的文本内容
+        citations: 引用列表
+        category: 分类标签 (POLICY/MACRO/CNY)
+    
+    Returns:
+        新闻列表，每条包含 title, summary, urls, category
+    """
+    # 提取有效 URLs
+    valid_urls = []
+    for c in citations:
+        if isinstance(c, str) and c.startswith('http'):
+            valid_urls.append(c)
+        elif isinstance(c, dict):
+            url = c.get('url') or c.get('link')
+            if url and url.startswith('http'):
+                valid_urls.append(url)
+    
+    news_items = []
+    
+    # 按数字编号分割新闻条目
+    # 匹配模式: "1. [TAG]" 或 "1.[TAG]" 或 "1、[TAG]"
+    pattern = r'(\d+)[\.\、\)]\s*\[(?:POLICY|MACRO|CNY)\]'
+    parts = re.split(pattern, content)
+    
+    # parts 结构: ['前导文本', '1', '新闻1内容', '2', '新闻2内容', ...]
+    i = 1
+    while i < len(parts) - 1:
+        news_num = parts[i]
+        news_content = parts[i + 1] if i + 1 < len(parts) else ""
+        
+        # 提取 TITLE 和 SUMMARY
+        title = ""
+        summary = ""
+        
+        # 匹配 TITLE 行
+        title_match = re.search(r'TITLE[:\s：]+(.+?)(?=SUMMARY|$)', news_content, re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = title_match.group(1).strip()
+            # 清理引用标记和换行
+            title = re.sub(r'\s*\[\d+\]\s*', ' ', title).strip()
+            title = re.sub(r'\n+', ' ', title).strip()
+        
+        # 匹配 SUMMARY 行
+        summary_match = re.search(r'SUMMARY[:\s：]+(.+?)(?=\d+[\.\、\)]\s*\[|$)', news_content, re.IGNORECASE | re.DOTALL)
+        if summary_match:
+            summary = summary_match.group(1).strip()
+            # 清理引用标记和多余换行
+            summary = re.sub(r'\s*\[\d+\]\s*', ' ', summary).strip()
+            summary = re.sub(r'\n+', ' ', summary).strip()
+        
+        # 提取引用编号
+        refs = re.findall(r'\[(\d+)\]', news_content)
+        urls = []
+        for ref in refs:
+            ref_idx = int(ref) - 1
+            if 0 <= ref_idx < len(valid_urls):
+                if valid_urls[ref_idx] not in urls:
+                    urls.append(valid_urls[ref_idx])
+        
+        # 只添加有效的新闻条目
+        if title:
+            news_items.append({
+                "category": category,
+                "title": title,
+                "summary": summary if summary else title,
+                "urls": urls[:2]  # 最多保留2个URL
+            })
+        
+        i += 2
+    
+    return news_items
+
+
+# ============================================================================
+# 主函数
+# ============================================================================
+
+def fetch_perplexity_news_v2(ctx) -> str:
+    """
+    使用 Perplexity API 获取外汇相关新闻（重构版）
+    
+    改进：
+    1. 分 3 类查询：央行政策、地缘宏观、人民币港元
+    2. Prompt 导向分析而非数据播报
+    3. 明确排除野鸡源
+    
+    Args:
+        ctx: DataContext 对象
+        
+    Returns:
+        状态消息字符串
     """
     api_key = os.getenv("PERPLEXITY_API_KEY")
     if not api_key:
@@ -594,7 +849,6 @@ def fetch_perplexity_news(ctx: DataContext) -> str:
     }
     
     # 计算日期范围
-    from datetime import timedelta
     today_date = datetime.now()
     week_ago = today_date - timedelta(days=7)
     today_display = today_date.strftime("%B %d, %Y")
@@ -621,220 +875,68 @@ def fetch_perplexity_news(ctx: DataContext) -> str:
     elif http_proxy or https_proxy:
         proxies = {"http": http_proxy, "https": https_proxy or http_proxy}
     
-    # ========== 英文 Prompt ==========
-    payload_en = {
-        "model": "sonar-pro",
-        "messages": [
-            {
-                "role": "system",
-                "content": f"""You are an FX market news editor. Search ONLY English sources from {week_ago_display} to {today_display}.
-
-Sources: Bloomberg, Reuters, Financial Times, WSJ, Federal Reserve, ECB, BOJ.
-
-Output format - for each news item:
-1. [EN]
-TITLE: Headline here [1]
-DETAIL: 150-200 word summary with specific data [1]
-
-2. [EN]
-TITLE: Next headline [2]
-DETAIL: Summary [2]
-
-IMPORTANT: 
-- Each news starts with number and [EN] on its own line
-- TITLE and DETAIL on separate lines
-- Every line must end with citation [1], [2], etc."""
-            },
-            {
-                "role": "user", 
-                "content": f"Find 8 important English FX news. Topics: Fed/FOMC, DXY, EUR/USD, USD/JPY, Treasury yields. Use the exact format specified."
-            }
-        ],
-        "max_tokens": 4000,
-        "temperature": 0.1,
-        "return_citations": True,
-        "search_recency_filter": "week"
-    }
+    # 准备 3 个查询
+    queries = [
+        ("POLICY", _get_prompt_policy(week_ago_display, today_display)),
+        ("MACRO", _get_prompt_geopolitical(week_ago_display, today_display)),
+        ("CNY", _get_prompt_cny_hkd(week_ago_cn, today_cn)),
+    ]
     
-    # ========== 中文 Prompt ==========
-    payload_cn = {
-        "model": "sonar-pro",
-        "messages": [
-            {
-                "role": "system",
-                "content": f"""你是外汇市场新闻编辑。只搜索 {week_ago_cn} 至 {today_cn} 的中文来源。
-
-来源：央行官网(pbc.gov.cn)、外管局(safe.gov.cn)、财新网、第一财经、金管局(hkma.gov.hk)。
-
-输出格式 - 每条新闻：
-1. [CN]
-TITLE: 标题内容 [1]
-DETAIL: 150-200字摘要，包含具体数据 [1]
-
-2. [CN]
-TITLE: 下一条标题 [2]
-DETAIL: 摘要内容 [2]
-
-重要：
-- 每条新闻以数字和[CN]开头，单独一行
-- TITLE和DETAIL分开两行
-- 每行结尾必须有引用标记[1], [2]等"""
-            },
-            {
-                "role": "user", 
-                "content": f"搜索7条重要中文外汇新闻。主题：人民币中间价、USD/CNY、央行政策、港元、金管局。严格按照指定格式输出。"
-            }
-        ],
-        "max_tokens": 3500,
-        "temperature": 0.1,
-        "return_citations": True,
-        "search_recency_filter": "week"
-    }
-    
-    # ========== 解析函数 ==========
-    def parse_response(content, citations, lang_tag):
-        """解析 Perplexity 返回内容"""
-        # 提取有效 URLs
-        valid_urls = []
-        for c in citations:
-            if isinstance(c, str) and c.startswith('http'):
-                valid_urls.append(c)
-            elif isinstance(c, dict):
-                url = c.get('url') or c.get('link')
-                if url and url.startswith('http'):
-                    valid_urls.append(url)
-        
-        lines = content.strip().split('\n')
-        news_items = []
-        current = {'title': '', 'detail': '', 'refs': []}
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # 检测新闻开始: "1. [EN]" 或 "1. [CN]" 或 "1.[EN]" 等
-            start_match = re.match(r'^(\d+)[\.\)]\s*\[(EN|CN)\]\s*$', line, re.IGNORECASE)
-            if start_match:
-                # 保存上一条
-                if current['title']:
-                    news_items.append(current.copy())
-                current = {'title': '', 'detail': '', 'refs': []}
-                continue
-            
-            # 检测 TITLE 行
-            if line.upper().startswith('TITLE:'):
-                # 提取引用标记
-                refs = re.findall(r'\[(\d+)\]', line)
-                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
-                # 清除引用标记后存储
-                current['title'] = re.sub(r'\s*\[\d+\]\s*', ' ', line[6:]).strip()
-                continue
-            
-            # 检测 DETAIL 行
-            if line.upper().startswith('DETAIL:'):
-                refs = re.findall(r'\[(\d+)\]', line)
-                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
-                current['detail'] = re.sub(r'\s*\[\d+\]\s*', ' ', line[7:]).strip()
-                continue
-            
-            # 累积 DETAIL（多行情况）
-            if current['title'] and not re.match(r'^\d+[\.\)]\s*\[', line):
-                refs = re.findall(r'\[(\d+)\]', line)
-                current['refs'].extend([int(r)-1 for r in refs if r.isdigit()])
-                clean = re.sub(r'\s*\[\d+\]\s*', ' ', line).strip()
-                if clean and not clean.startswith('#'):
-                    current['detail'] += ' ' + clean
-        
-        # 保存最后一条
-        if current['title']:
-            news_items.append(current.copy())
-        
-        # 构建结果
-        results = []
-        for item in news_items:
-            title = f"[{lang_tag}] TITLE: {item['title']}"
-            detail = item['detail'] if item['detail'] else item['title']
-            # 分配 URLs
-            urls = []
-            for ref_idx in set(item['refs']):
-                if 0 <= ref_idx < len(valid_urls):
-                    urls.append(valid_urls[ref_idx])
-            results.append((title, detail, urls))
-        
-        return results, len(valid_urls)
-    
-    # ========== 执行 API 调用 ==========
     all_news = []
-    total_urls = 0
-    en_count = 0
-    cn_count = 0
+    stats = {"POLICY": 0, "MACRO": 0, "CNY": 0}
     
-    try:
-        session = requests.Session()
-        
-        # 调用英文 API
+    session = requests.Session()
+    
+    for category, payload in queries:
         try:
-            resp_en = session.post(
+            resp = session.post(
                 "https://api.perplexity.ai/chat/completions",
-                headers=headers, json=payload_en,
-                timeout=TIMEOUT_CONFIG["perplexity"], verify=False, proxies=proxies  # verify=False 为兼容代理环境
+                headers=headers,
+                json=payload,
+                timeout=TIMEOUT_CONFIG.get("perplexity", (30, 90)),
+                verify=False,  # 为兼容代理环境
+                proxies=proxies
             )
-            if resp_en.status_code == 200:
-                result = resp_en.json()
+            
+            if resp.status_code == 200:
+                result = resp.json()
                 content = result['choices'][0]['message']['content']
                 citations = result.get('citations', [])
                 if not citations:
                     citations = result['choices'][0].get('message', {}).get('citations', [])
-                news_en, urls_en = parse_response(content, citations, 'EN')
-                all_news.extend(news_en)
-                total_urls += urls_en
-                en_count = len(news_en)
+                
+                news_items = _parse_news_response(content, citations, category)
+                all_news.extend(news_items)
+                stats[category] = len(news_items)
             else:
-                ctx.errors.append(f"Perplexity EN: {resp_en.status_code}")
+                ctx.errors.append(f"Perplexity {category}: HTTP {resp.status_code}")
+                
         except Exception as e:
-            ctx.errors.append(f"Perplexity EN: {str(e)[:50]}")
-        
-        # 调用中文 API
-        try:
-            resp_cn = session.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers=headers, json=payload_cn,
-                timeout=TIMEOUT_CONFIG["perplexity"], verify=False, proxies=proxies  # verify=False 为兼容代理环境
-            )
-            if resp_cn.status_code == 200:
-                result = resp_cn.json()
-                content = result['choices'][0]['message']['content']
-                citations = result.get('citations', [])
-                if not citations:
-                    citations = result['choices'][0].get('message', {}).get('citations', [])
-                news_cn, urls_cn = parse_response(content, citations, 'CN')
-                all_news.extend(news_cn)
-                total_urls += urls_cn
-                cn_count = len(news_cn)
-            else:
-                ctx.errors.append(f"Perplexity CN: {resp_cn.status_code}")
-        except Exception as e:
-            ctx.errors.append(f"Perplexity CN: {str(e)[:50]}")
-        
-        # 存储结果
-        news_with_urls = 0
-        for title, detail, urls in all_news:
-            ctx.news.append(title)
-            ctx.news_detail.append(detail)
-            ctx.news_sources.append(urls)
-            if urls:
-                news_with_urls += 1
-        
-        ctx.data_sources["news"] = "Perplexity(EN+CN)"
-        ctx.data_sources["news_valid_urls"] = total_urls
-        
-        return f"✅ 新闻: {len(all_news)} 条 (EN:{en_count} + CN:{cn_count}, 有链接: {news_with_urls}/{len(all_news)})"
-        
-    except Exception as e:
-        ctx.errors.append(f"Perplexity: {str(e)[:60]}")
-        return f"⚠️ Perplexity: {str(e)[:40]}"
+            ctx.errors.append(f"Perplexity {category}: {str(e)[:50]}")
+    
+    # 存储到 ctx
+    for item in all_news:
+        # 格式化标题：[分类] 标题
+        formatted_title = f"[{item['category']}] {item['title']}"
+        ctx.news.append(formatted_title)
+        ctx.news_detail.append(item['summary'])
+        ctx.news_sources.append(item['urls'])
+    
+    ctx.data_sources["news"] = "Perplexity(Policy+Macro+CNY)"
+    
+    total = len(all_news)
+    return f"✅ 新闻: {total}条 (政策:{stats['POLICY']} 宏观:{stats['MACRO']} 人民币:{stats['CNY']})"
 
+
+# ============================================================================
+# 兼容旧接口
+# ============================================================================
+
+def fetch_perplexity_news(ctx) -> str:
+    """
+    兼容旧接口，内部调用新版本
+    """
+    return fetch_perplexity_news_v2(ctx)
 
 def calculate_metrics(ctx: DataContext) -> str:
     results = []
