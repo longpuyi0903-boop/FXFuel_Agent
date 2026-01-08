@@ -2,7 +2,7 @@
 
 import json
 from typing import Any
-from config import HISTORY_ANCHORS
+from config import HISTORY_ANCHORS, TOKEN_CONFIG
 
 # ============================================================================
 # 系统提示词：定义 AI 行为边界
@@ -202,19 +202,66 @@ def _replace_none_with_placeholder(data: Any) -> Any:
         return data
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    粗略估算文本的 Token 数
+    中文约 1.5 字符/token，英文约 4 字符/token
+    这里用配置中的 chars_per_token 作为平均值
+    """
+    return int(len(text) / TOKEN_CONFIG["chars_per_token"])
+
+
+def _compress_data_if_needed(data_dict: dict) -> dict:
+    """
+    如果数据超过 Token 限制，压缩新闻数量
+    
+    压缩策略：
+    1. 优先保留核心数值数据（cny, hkd, global_fx, macro）
+    2. 压缩 news_detail 到指定条数
+    3. 同步压缩 news 和 news_sources
+    """
+    # 先序列化检查大小
+    test_json = json.dumps(data_dict, ensure_ascii=False)
+    estimated_tokens = _estimate_tokens(test_json)
+    
+    max_tokens = TOKEN_CONFIG["max_context_tokens"]
+    max_news = TOKEN_CONFIG["max_news_items"]
+    
+    if estimated_tokens <= max_tokens:
+        return data_dict  # 未超限，不需要压缩
+    
+    # 需要压缩：裁剪新闻
+    if "news_detail" in data_dict and len(data_dict.get("news_detail", [])) > max_news:
+        data_dict["news_detail"] = data_dict["news_detail"][:max_news]
+        data_dict["_token_note"] = f"新闻已压缩至{max_news}条以控制Token"
+    
+    if "news" in data_dict and len(data_dict.get("news", [])) > max_news:
+        data_dict["news"] = data_dict["news"][:max_news]
+    
+    if "news_sources" in data_dict and len(data_dict.get("news_sources", [])) > max_news:
+        data_dict["news_sources"] = data_dict["news_sources"][:max_news]
+    
+    return data_dict
+
+
 def get_report_prompt(data_json: str) -> dict:
     """
     获取报告生成的完整提示词
     
     处理逻辑：
     1. 解析 JSON，将 None 值替换为 "数据暂缺"
-    2. 重新序列化为 JSON
-    3. 注入历史锚点数据
+    2. 检查 Token 预算，必要时压缩新闻数量 (P0-1 新增)
+    3. 重新序列化为 JSON
+    4. 注入历史锚点数据
     """
     # 解析 JSON 并替换 None 值
     try:
         data_dict = json.loads(data_json)
         data_dict_cleaned = _replace_none_with_placeholder(data_dict)
+        
+        # P0-1: Token 预算管理 - 检查并压缩
+        data_dict_cleaned = _compress_data_if_needed(data_dict_cleaned)
+        
         data_json_cleaned = json.dumps(data_dict_cleaned, ensure_ascii=False, indent=2)
     except (json.JSONDecodeError, TypeError):
         # 如果解析失败，使用原始 JSON（但尝试替换字符串中的 null）

@@ -14,6 +14,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# P0-2: 导入超时配置; P1: 导入缓存 TTL 配置
+try:
+    from config import TIMEOUT_CONFIG, CACHE_TTL
+except ImportError:
+    # 如果 config.py 未更新，使用默认值
+    TIMEOUT_CONFIG = {
+        "default": (10, 30),
+        "akshare": (10, 20),
+        "fred": (10, 30),
+        "perplexity": (30, 90),
+        "yahoo": (10, 15),
+        "hkma": (10, 20),
+    }
+    CACHE_TTL = {
+        "cny_mid": 3600,
+        "cny_spot": 60,
+        "hkd": 60,
+        "fred": 300,
+        "global_fx": 60,
+        "news": 600,
+    }
+
 # SSL修复
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -39,6 +61,53 @@ def create_retry_session(retries=3, backoff_factor=1):
     return session
 
 RETRY_SESSION = create_retry_session()
+
+
+# ============================================================================
+# P1: 简单缓存模块
+# ============================================================================
+
+import time as _time
+from typing import TypeVar
+
+_cache: Dict[str, Any] = {}
+_cache_time: Dict[str, float] = {}
+
+T = TypeVar('T')
+
+def get_with_cache(key: str, fetch_func: Callable[[], T], ttl_seconds: int) -> T:
+    """
+    带 TTL 的简单缓存
+    
+    Args:
+        key: 缓存键名
+        fetch_func: 获取数据的函数
+        ttl_seconds: 缓存有效期（秒）
+        
+    Returns:
+        缓存的数据或新获取的数据
+        
+    TTL 推荐值（参考 config.CACHE_TTL）:
+    - 中间价 (cny_mid): 3600秒（9:15发布后整天不变）
+    - 实时汇率 (cny_spot): 60秒
+    - FRED 数据: 300秒
+    - 新闻: 600秒
+    """
+    now = _time.time()
+    if key in _cache and (now - _cache_time.get(key, 0)) < ttl_seconds:
+        return _cache[key]
+    
+    result = fetch_func()
+    _cache[key] = result
+    _cache_time[key] = now
+    return result
+
+
+def clear_cache():
+    """清除所有缓存（用于强制刷新）"""
+    global _cache, _cache_time
+    _cache = {}
+    _cache_time = {}
 
 
 class DataContext:
@@ -208,7 +277,7 @@ def fetch_hkd_data(ctx: DataContext) -> str:
                 resp = requests.get(
                     "https://query1.finance.yahoo.com/v8/finance/chart/HKDUSD=X?interval=1d&range=1d",
                     headers=headers,
-                    timeout=15
+                    timeout=TIMEOUT_CONFIG["yahoo"]
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -232,7 +301,7 @@ def fetch_hkd_data(ctx: DataContext) -> str:
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
             url = "https://api.hkma.gov.hk/public/market-data-and-statistics/monthly-statistical-bulletin/er-ir/hk-interbank-ir-daily"
-            resp = RETRY_SESSION.get(url, headers=headers, timeout=30, verify=False)
+            resp = RETRY_SESSION.get(url, headers=headers, timeout=TIMEOUT_CONFIG["hkma"], verify=False)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'result' in data and 'records' in data['result'] and data['result']['records']:
@@ -287,7 +356,7 @@ def fetch_dxy_direct(ctx: DataContext) -> bool:
         resp = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1d&range=5d",
             headers=headers,
-            timeout=15
+            timeout=TIMEOUT_CONFIG["yahoo"]
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -709,7 +778,7 @@ DETAIL: 摘要内容 [2]
             resp_en = session.post(
                 "https://api.perplexity.ai/chat/completions",
                 headers=headers, json=payload_en,
-                timeout=(30, 120), verify=False, proxies=proxies
+                timeout=TIMEOUT_CONFIG["perplexity"], verify=False, proxies=proxies  # verify=False 为兼容代理环境
             )
             if resp_en.status_code == 200:
                 result = resp_en.json()
@@ -731,7 +800,7 @@ DETAIL: 摘要内容 [2]
             resp_cn = session.post(
                 "https://api.perplexity.ai/chat/completions",
                 headers=headers, json=payload_cn,
-                timeout=(30, 120), verify=False, proxies=proxies
+                timeout=TIMEOUT_CONFIG["perplexity"], verify=False, proxies=proxies  # verify=False 为兼容代理环境
             )
             if resp_cn.status_code == 200:
                 result = resp_cn.json()

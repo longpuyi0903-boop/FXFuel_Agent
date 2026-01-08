@@ -59,7 +59,17 @@ REPORT_CONFIG = {
     "top_p": 0.95
 }
 
-# --- 6. 历史锚点数据（用于 LLM 历史对比参考） ---
+# --- 6. 超时配置 (P0-2 新增) ---
+TIMEOUT_CONFIG = {
+    "default": (10, 30),      # (连接超时, 读取超时) 秒 - 通用默认值
+    "akshare": (10, 20),      # AKShare 国内源，响应较快
+    "fred": (10, 30),         # FRED API
+    "perplexity": (30, 90),   # Perplexity 响应较慢，需要更长超时
+    "yahoo": (10, 15),        # Yahoo Finance
+    "hkma": (10, 20),         # 香港金管局
+}
+
+# --- 7. 历史锚点数据（用于 LLM 历史对比参考） ---
 HISTORY_ANCHORS = {
     "USDCNY_2022_HIGH": 7.328,  # 2022年11月高点
     "USDCNY_2023_HIGH": 7.351,  # 2023年9月高点
@@ -68,7 +78,7 @@ HISTORY_ANCHORS = {
     "HKD_STRONG_SIDE": 7.75     # 强方兑换保证（固定）
 }
 
-# --- 7. 核心指标配置（用于硬校验） ---
+# --- 8. 核心指标配置（用于硬校验） ---
 CORE_INDICATORS = {
     # --- 汇率类 (FX) ---
     "USD/CNY": {
@@ -152,7 +162,24 @@ CORE_INDICATORS = {
 # 默认容差（防御性编程）
 DEFAULT_TOLERANCE = 0.05
 
-# --- 8. 辅助函数 ---
+# --- 9. Token 管理配置 (P0-1 新增) ---
+TOKEN_CONFIG = {
+    "max_context_tokens": 6000,   # Context 最大 Token 数（保守值，留空间给输出）
+    "max_news_items": 7,          # 超限时保留的新闻条数
+    "chars_per_token": 1.5,       # 中文约 1.5 字符/token
+}
+
+# --- 10. 数据缓存配置 (P1 新增) ---
+CACHE_TTL = {
+    "cny_mid": 3600,        # 中间价：1小时（9:15发布后整天不变）
+    "cny_spot": 60,         # 实时汇率：1分钟
+    "hkd": 60,              # 港元汇率：1分钟
+    "fred": 300,            # FRED 数据：5分钟
+    "global_fx": 60,        # 全球外汇：1分钟
+    "news": 600,            # 新闻：10分钟
+}
+
+# --- 11. 辅助函数 ---
 def get_proxy_status():
     """返回代理状态"""
     return HTTP_PROXY or HTTPS_PROXY
